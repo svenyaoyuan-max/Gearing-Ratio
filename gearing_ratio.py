@@ -3,6 +3,7 @@
 import pandas as pd
 import time
 import base64
+import json
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -14,6 +15,80 @@ from importlib import resources
 from datetime import datetime
 import sys
 import os
+
+
+class DataSourceError(Exception):
+    """
+    Raised when an upstream data source returns no usable data.
+
+    ``transient`` is True when the failure is likely temporary (empty body,
+    rate-limiting, 5xx) and worth retrying, and False when it is permanent
+    for this input (bad ticker, unexpected payload).
+    """
+    def __init__(self, message, transient=False):
+        super().__init__(message)
+        self.transient = transient
+
+
+# A normal browser UA — some endpoints return an empty body to non-browser clients.
+_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _fetch_json(method, url, *, source, build_headers, params=None,
+                retries=4, timeout=20, backoff=0.8):
+    """
+    Perform an HTTP request and return parsed JSON, retrying on the failure
+    modes these Chinese finance endpoints exhibit: empty bodies, transient
+    5xx/429, stale time-based auth tokens, and non-JSON error pages.
+
+    ``build_headers`` is a zero-arg callable returning a fresh headers dict so
+    time-sensitive tokens are regenerated on every attempt.
+
+    Raises DataSourceError with a human-readable message if all attempts fail.
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.request(
+                method, url, params=params,
+                headers=build_headers(), timeout=timeout,
+            )
+        except requests.exceptions.RequestException as exc:
+            last_err = f"network error contacting {source}: {exc}"
+        else:
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_err = f"{source} returned HTTP {resp.status_code}"
+            elif resp.status_code != 200:
+                # 4xx other than 429 won't fix itself on retry.
+                raise DataSourceError(
+                    f"{source} returned HTTP {resp.status_code}."
+                )
+            elif not resp.text or not resp.text.strip():
+                # The classic empty-body case behind
+                # "Expecting value: line 1 column 1 (char 0)".
+                last_err = f"{source} returned an empty response"
+            else:
+                try:
+                    return resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    snippet = resp.text.strip()[:120].replace("\n", " ")
+                    last_err = (
+                        f"{source} returned a non-JSON response "
+                        f"(starts with: {snippet!r})"
+                    )
+
+        if attempt < retries:
+            time.sleep(backoff * attempt)
+
+    raise DataSourceError(
+        f"Could not get data from {source} after {retries} attempts "
+        f"({last_err}). The source may be rate-limiting or temporarily "
+        f"unavailable — please try again in a moment.",
+        transient=True,
+    )
 
 
 def resource_path(relative_path):
@@ -52,23 +127,30 @@ def stock_profile_cninfo(symbol: str = "600030") -> pd.DataFrame:
     params = {
         "scode": symbol,
     }
-    mcode = _getResCode1()
-    headers = {
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Cache-Control": "no-cache",
-        "Content-Length": "0",
-        "Host": "webapi.cninfo.com.cn",
-        "Accept-Enckey": mcode,
-        "Origin": "https://webapi.cninfo.com.cn",
-        "Pragma": "no-cache",
-        "Proxy-Connection": "keep-alive",
-        "Referer": "https://webapi.cninfo.com.cn/",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    r = requests.post(url, params=params, headers=headers)
-    data_json = r.json()
+
+    def build_headers():
+        # Regenerate the time-based auth token on every attempt — a stale
+        # token is one reason CNInfo replies with an empty body.
+        return {
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Content-Length": "0",
+            "Host": "webapi.cninfo.com.cn",
+            "Accept-Enckey": _getResCode1(),
+            "Origin": "https://webapi.cninfo.com.cn",
+            "Pragma": "no-cache",
+            "Referer": "https://webapi.cninfo.com.cn/",
+            "User-Agent": _UA,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+    data_json = _fetch_json(
+        "POST", url, source="CNInfo", build_headers=build_headers, params=params,
+    )
+    if not isinstance(data_json, dict) or "count" not in data_json:
+        raise DataSourceError("CNInfo returned an unexpected payload.")
     columns = [
         "公司名称",
         "英文名称",
@@ -139,11 +221,34 @@ def stock_financial_report_sina(
         "page": "1",
         "num": "1000",
     }
-    r = requests.get(url, params=params)
-    data_json = r.json()
-    df_columns = [
-        item["date_value"] for item in data_json["result"]["data"]["report_date"]
-    ]
+
+    def build_headers():
+        return {
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://finance.sina.com.cn/",
+            "User-Agent": _UA,
+        }
+
+    data_json = _fetch_json(
+        "GET", url, source="Sina Finance",
+        build_headers=build_headers, params=params,
+    )
+
+    # Validate the structure before indexing into it — a valid HTTP 200 can
+    # still carry an error payload (e.g. unknown ticker) with no report data.
+    try:
+        report_date = data_json["result"]["data"]["report_date"]
+    except (TypeError, KeyError):
+        raise DataSourceError(
+            f"Sina Finance returned no financial report for '{stock}'."
+        )
+    if not report_date:
+        raise DataSourceError(
+            f"No balance-sheet data available for '{stock}'."
+        )
+
+    df_columns = [item["date_value"] for item in report_date]
     big_df = pd.DataFrame()
     temp_df = pd.DataFrame()
     for date_str in df_columns:

@@ -7,7 +7,30 @@ import pandas as pd
 import streamlit as st
 
 # ── Load data functions from gearing_ratio.py (same directory) ───────────────
-from gearing_ratio import stock_profile_cninfo, stock_financial_report_sina
+from gearing_ratio import (
+    stock_profile_cninfo,
+    stock_financial_report_sina,
+    DataSourceError,
+)
+
+
+def sina_prefix(ticker: str, market: str = "") -> str:
+    """
+    Pick the Sina exchange prefix for any A/B-share ticker.
+    Prefer the CNInfo market field, fall back to the numeric range.
+    """
+    if "上海" in market or "上交所" in market:
+        return "sh"
+    if "深圳" in market or "深交所" in market:
+        return "sz"
+    if "北京" in market or "北交所" in market:
+        return "bj"
+    # Numeric fallback by leading digits.
+    if ticker.startswith(("6", "9")):          # Shanghai A / B
+        return "sh"
+    if ticker.startswith(("4", "8")):          # Beijing Stock Exchange
+        return "bj"
+    return "sz"                                # Shenzhen A (0/3) / B (2)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -245,10 +268,21 @@ st.markdown("<hr>", unsafe_allow_html=True)
 
 if "result" not in st.session_state:
     st.session_state.result = None
+if "retry_requested" not in st.session_state:
+    st.session_state.retry_requested = False
+
+
+def _request_retry():
+    """on_click callback: re-trigger the analysis on the next rerun."""
+    st.session_state.retry_requested = True
 
 
 # ── Calculate ─────────────────────────────────────────────────────────────────
-if run:
+# Trigger on the Analyse button OR a one-click retry after a transient failure.
+trigger = run or st.session_state.retry_requested
+st.session_state.retry_requested = False  # consume the flag
+
+if trigger:
     if len(ticker) != 6 or not ticker.isdigit():
         st.error("Please enter a valid 6-digit stock ticker.")
         st.stop()
@@ -270,9 +304,12 @@ if run:
             prof_lbls = profile_df.loc[0, prof_cols].index.tolist()
 
             market    = str(profile_df.loc[0, "所属市场"])
-            sina_code = ("sh" if "上海" in market or ticker.startswith(("6","9")) else "sz") + ticker
+            sina_code = sina_prefix(ticker, market) + ticker
 
             df2 = stock_financial_report_sina(stock=sina_code, symbol="资产负债表").head(1)
+            if df2.empty:
+                st.error(f"No balance-sheet data available for ticker {ticker}.")
+                st.stop()
             cols = df2.columns.tolist()
 
             # ── Detect institution type ───────────────────────────────────────
@@ -435,8 +472,23 @@ if run:
                 "inst_type":    inst_type,
             }
 
+        except DataSourceError as e:
+            if getattr(e, "transient", False):
+                st.warning(
+                    f"⏳ **The data source is temporarily busy.**\n\n"
+                    f"CNInfo / Sina Finance didn't respond for ticker "
+                    f"**{ticker}** just now — this is usually short-lived "
+                    f"rate-limiting, not a problem with your input. "
+                    f"Wait a few seconds and click **Retry** below.",
+                    icon="⏳",
+                )
+                st.button("🔄 Retry", key="retry_transient",
+                          type="primary", on_click=_request_retry)
+            else:
+                st.error(f"⚠️ {e}")
+            st.stop()
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Unexpected error while analysing {ticker}: {e}")
             st.stop()
 
 
