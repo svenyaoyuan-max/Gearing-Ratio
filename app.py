@@ -7,11 +7,15 @@ import pandas as pd
 import streamlit as st
 
 # ── Load data functions from gearing_ratio.py (same directory) ───────────────
-from gearing_ratio import (
-    stock_profile_cninfo,
-    stock_financial_report_sina,
-    DataSourceError,
-)
+from gearing_ratio import stock_profile_cninfo, stock_financial_report_sina
+
+try:
+    from gearing_ratio import DataSourceError
+except ImportError:
+    # Fallback if a stale gearing_ratio.py (without DataSourceError) is deployed —
+    # keeps the app loading instead of crashing on import.
+    class DataSourceError(Exception):
+        transient = False
 
 
 def sina_prefix(ticker: str, market: str = "") -> str:
